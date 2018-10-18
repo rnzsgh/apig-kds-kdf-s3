@@ -142,7 +142,7 @@ Resources:
   IngestionApiGatewayLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub /ingestion/apig/${AWS::StackName}
+      LogGroupName: !Sub /ingestion/${AWS::StackName}/apig
 
   IngestionApiAccountRole:
     Type: AWS::IAM::Role
