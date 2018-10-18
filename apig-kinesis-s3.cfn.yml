@@ -1,0 +1,315 @@
+---
+
+# Any code, applications, scripts, templates, proofs of concept,
+# documentation and other items are provided for illustration purposes only.
+
+AWSTemplateFormatVersion: 2010-09-09
+
+
+Parameters:
+
+  IngestionKinesisDataStreamShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 650 # Soft limit - requires increase request
+
+  IngestionKinesisDataStreamRetentionHours:
+    Type: Number
+    Default: 24
+    MinValue: 24
+    MaxValue: 168
+    ConstraintDescription: Period in hours must be between 24 and 168
+
+  IngestionKinesisDataStreamBufferIntervalInSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    ConstraintDescription: Period in seconds must be between 60 and 900
+
+  IngestionKinesisDataStreamBufferSizeInMBs:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 128
+    ConstraintDescription: Period in seconds must be between 1 and 128
+
+  BillingCode:
+    Type: String
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: "^[a-zA-Z][-a-zA-Z0-9]*$"
+
+
+Resources:
+
+  IngestionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Cost
+          Value: !Ref BillingCode
+
+  IngestionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ingestion/${AWS::StackName}
+
+  IngestionKinesisDataFirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref IngestionLogGroup
+      LogStreamName: kinesis-data-firehose
+
+  IngestionKinesisDataFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: ingestion-firehose-role
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${IngestionBucket}
+                  - !Sub arn:aws:s3:::${IngestionBucket}/*
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+              - Effect: Allow
+                Resource: !GetAtt IngestionKinesisDataStream.Arn
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+              - Effect: Allow
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${IngestionLogGroup}:log-stream:${IngestionKinesisDataFirehoseLogStream}
+                Action: logs:PutLogEvents
+
+  IngestionKinesisDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: !Ref IngestionKinesisDataStreamShardCount
+      RetentionPeriodHours: !Ref IngestionKinesisDataStreamRetentionHours
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Cost
+          Value: !Ref BillingCode
+
+  IngestionKinesisDataFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt IngestionKinesisDataStream.Arn
+        RoleARN: !GetAtt IngestionKinesisDataFirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        Prefix: !Sub ${BillingCode}/
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref IngestionLogGroup
+          LogStreamName: !Ref IngestionKinesisDataFirehoseLogStream
+        BucketARN: !GetAtt IngestionBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: !Ref IngestionKinesisDataStreamBufferIntervalInSeconds
+          SizeInMBs: !Ref IngestionKinesisDataStreamBufferSizeInMBs
+        CompressionFormat: GZIP
+        RoleARN: !GetAtt IngestionKinesisDataFirehoseRole.Arn
+
+
+  IngestionApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ingestion/apig/${AWS::StackName}
+
+  IngestionApiAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  IngestionApiAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt IngestionApiAccountRole.Arn
+
+  IngestionApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref AWS::StackName
+      EndpointConfiguration:
+        Types:
+          - EDGE
+    DependsOn: IngestionApiAccount
+
+  IngestionApiCertificate:
+    Type: AWS::ApiGateway::ClientCertificate
+
+  IngestionApiIngestServiceProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      PathPart: i
+      RestApiId:
+        !Ref IngestionApi
+      ParentId:
+        !GetAtt IngestionApi.RootResourceId
+    DependsOn:
+      - IngestionApi
+
+  IngestionApiGatewayProxyKinesisPutRecordsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: api-gateway-kinesis-put-records
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt IngestionKinesisDataStream.Arn
+
+  IntegrationApiGatewayProxyKinesisPutRecordsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: api-gateway-kinesis-put-records
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt IngestionKinesisDataStream.Arn
+
+  IngestionApiIngestServiceProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref IngestionApi
+      ResourceId: !Ref IngestionApiIngestServiceProxyResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Credentials: !GetAtt IntegrationApiGatewayProxyKinesisPutRecordsRole.Arn
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:kinesis:action/PutRecord
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+    DependsOn:
+      - IngestionApi
+      - IngestionApiIngestServiceProxyResource
+      - IngestionApiGatewayProxyKinesisPutRecordsRole
+
+    #IngestionApiRequestModel:
+    #Type: AWS::ApiGateway::Model
+    #Properties:
+    #ContentType: application/json
+    #RestApiId: !Ref IngestionApi
+    #{ "PartitionKey": "$context.requestId", "StreamName": "$STREAM_NAME\", "Data": "" }
+
+
+  IngestionApiProdDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref IngestionApi
+      StageName: p
+      StageDescription:
+        AccessLogSetting:
+          DestinationArn: !GetAtt IngestionApiGatewayLogGroup.Arn
+        MetricsEnabled: true
+        LoggingLevel: ERROR
+
+    DependsOn:
+      - IngestionApi
+      - IngestionApiIngestServiceProxyMethod
+
+
+
+Outputs:
+
+  IngestionKinesisDataStreamArn:
+    Value: !GetAtt IngestionKinesisDataStream.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ingestion-kinesis-data-stream-arn
+
+  IngestionApiId:
+    Value: !Ref IngestionApi
+    Export:
+      Name: !Sub ${AWS::StackName}-ingestion-api-gateway-id
+
+  IngestionApiRootResourceId:
+    Value: !GetAtt IngestionApi.RootResourceId
+    Export:
+      Name: !Sub ${AWS::StackName}-ingestion-api-gateway-root-resource-id
+
+  IngestionApiCertificateName:
+    Value: !Ref IngestionApiCertificate
+    Export:
+      Name: !Sub ${AWS::StackName}-ingestion-api-gateway-client-cert-name
+
+  IngestionApiProdDeploymentId:
+    Value: !Ref IngestionApiProdDeployment
+    Export:
+      Name: !Sub ${AWS::StackName}-ingestion-api-gateway-prod-deployment-id
+
+  IngestionApiGatewayProxyKinesisPutRecordsRoleArn:
+    Value: !GetAtt IngestionApiGatewayProxyKinesisPutRecordsRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ingestion-api-gateway-proxy-kinesis-put-records-role-arn
