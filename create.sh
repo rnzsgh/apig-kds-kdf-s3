@@ -1,6 +1,6 @@
 #!/bin/bash
 
-STACK_NAME=k0
+STACK_NAME=ingest
 
 REGION=us-east-1
 
